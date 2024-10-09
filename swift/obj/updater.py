@@ -23,7 +23,7 @@ import time
 import uuid
 from random import random, shuffle
 from bisect import insort
-from collections import deque
+from collections import deque, defaultdict
 
 from eventlet import spawn, Timeout
 
@@ -229,36 +229,38 @@ class OldestAsyncPendingTracker:
         max_entries,
     ):
         self.max_entries = max_entries
-        self.sorted_entries = []
-        self.ac_to_timestamp = {}
+        self.sorted_entries = defaultdict(list)
+        self.ac_to_timestamp = defaultdict(dict)
 
-    def add_update(self, account, container, timestamp):
+    def add_update(self, account, container, timestamp, update_type):
         ac = (account, container)
 
-        if ac in self.ac_to_timestamp:
-            old_timestamp = self.ac_to_timestamp[ac]
+        if ac in self.ac_to_timestamp[update_type]:
+            old_timestamp = self.ac_to_timestamp[update_type][ac]
             # Only replace the existing timestamp if the new one is older
             if timestamp < old_timestamp:
                 # Remove the old (timestamp, ac) from the
-                # sorted list
-                self.sorted_entries.remove((old_timestamp, ac))
+                # sorted list for this update type
+                self.sorted_entries[update_type].remove(
+                    (old_timestamp, ac)
+                )
                 # Insert the new (timestamp, ac) in the sorted order
-                insort(self.sorted_entries, (timestamp, ac))
-                # Update the ac_to_timestamp dictionary
-                self.ac_to_timestamp[ac] = timestamp
+                insort(self.sorted_entries[update_type], (timestamp, ac))
+                # Update the ac_to_timestamp dictionary for this update type
+                self.ac_to_timestamp[update_type][ac] = timestamp
         else:
             # Insert the new (timestamp, ac) in the sorted order
-            insort(self.sorted_entries, (timestamp, ac))
-            self.ac_to_timestamp[ac] = timestamp
+            insort(self.sorted_entries[update_type], (timestamp, ac))
+            self.ac_to_timestamp[update_type][ac] = timestamp
 
         # Check size and evict the newest ac(s) if necessary
-        if (len(self.ac_to_timestamp) > self.max_entries):
-            # Pop the newest entry (largest timestamp)
-            _, newest_ac = (self.sorted_entries.pop())
-            del self.ac_to_timestamp[newest_ac]
+        if len(self.ac_to_timestamp[update_type]) > self.max_entries:
+            # Pop the newest entry (largest timestamp) for this update type
+            _, newest_ac = self.sorted_entries[update_type].pop()
+            del self.ac_to_timestamp[update_type][newest_ac]
 
-    def get_n_oldest_timestamp_acs(self, n):
-        oldest_entries = self.sorted_entries[:n]
+    def get_n_oldest_timestamp_acs(self, n, update_type):
+        oldest_entries = self.sorted_entries[update_type][:n]
         return {
             'oldest_count': len(oldest_entries),
             'oldest_entries': [
@@ -271,21 +273,21 @@ class OldestAsyncPendingTracker:
             ],
         }
 
-    def get_oldest_timestamp(self):
-        if self.sorted_entries:
-            return float(self.sorted_entries[0][0])
+    def get_oldest_timestamp(self, update_type):
+        if self.sorted_entries[update_type]:
+            return float(self.sorted_entries[update_type][0][0])
         return None
 
-    def get_oldest_timestamp_age(self):
+    def get_oldest_timestamp_age(self, update_type):
         current_time = time.time()
-        oldest_timestamp = self.get_oldest_timestamp()
+        oldest_timestamp = self.get_oldest_timestamp(update_type)
         if oldest_timestamp is not None:
             return current_time - oldest_timestamp
         return None
 
     def reset(self):
-        self.sorted_entries = []
-        self.ac_to_timestamp = {}
+        self.sorted_entries = defaultdict(list)
+        self.ac_to_timestamp = defaultdict(dict)
 
     def get_memory_usage(self):
         return self._get_size(self)
@@ -545,17 +547,51 @@ class ObjectUpdater(Daemon):
         """Gathers stats and dumps recon cache."""
         object_updater_stats = {
             'failures_oldest_timestamp': (
-                self.oldest_async_pendings.get_oldest_timestamp()
+                self.oldest_async_pendings.get_oldest_timestamp('failures')
             ),
             'failures_oldest_timestamp_age': (
-                self.oldest_async_pendings.get_oldest_timestamp_age()
+                self.oldest_async_pendings.get_oldest_timestamp_age('failures')
             ),
             'failures_account_container_count': (
-                len(self.oldest_async_pendings.ac_to_timestamp)
+                len(self.oldest_async_pendings.ac_to_timestamp['failures'])
             ),
             'failures_oldest_timestamp_account_containers': (
                 self.oldest_async_pendings.get_n_oldest_timestamp_acs(
-                    self.dump_count
+                    self.dump_count, 'failures'
+                )
+            ),
+            'unlinks_oldest_timestamp': (
+                self.oldest_async_pendings.get_oldest_timestamp('unlinks')
+            ),
+            'unlinks_oldest_timestamp_age': (
+                self.oldest_async_pendings.get_oldest_timestamp_age('unlinks')
+            ),
+            'unlinks_account_container_counts': (
+                len(self.oldest_async_pendings.ac_to_timestamp['unlinks'])
+            ),
+            'unlinks_timestamp_account_containers': (
+                self.oldest_async_pendings.get_n_oldest_timestamp_acs(
+                    self.dump_count, 'unlinks'
+                )
+            ),
+            'outdated_unlinks_oldest_timestamp': (
+                self.oldest_async_pendings.get_oldest_timestamp(
+                    'outdated_unlinks'
+                )
+            ),
+            'outdated_unlinks_oldest_timestamp_age': (
+                self.oldest_async_pendings.get_oldest_timestamp_age(
+                    'outdated_unlinks'
+                )
+            ),
+            'outdated_unlinks_account_container_counts': (
+                len(self.oldest_async_pendings.ac_to_timestamp[
+                    'outdated_unlinks'
+                ])
+            ),
+            'outdated_unlinks_timestamp_account_containers': (
+                self.oldest_async_pendings.get_n_oldest_timestamp_acs(
+                    self.dump_count, 'outdated_unlinks'
                 )
             ),
             'tracker_memory_usage': (
@@ -667,6 +703,13 @@ class ObjectUpdater(Daemon):
                     if obj_hash == last_obj_hash:
                         self.stats.outdated_unlinks += 1
                         self.logger.increment('outdated_unlinks')
+                        update = self._load_update(device, update_path)
+                        if update:
+                            acct, cont = split_update_path(update)
+                            self.oldest_async_pendings.add_update(
+                                acct, cont, float(timestamp),
+                                'outdated_unlinks'
+                            )
                         try:
                             os.unlink(update_path)
                         except OSError as e:
@@ -806,6 +849,9 @@ class ObjectUpdater(Daemon):
                     os.rmdir(os.path.dirname(update_path))
                 except OSError:
                     pass
+                self.oldest_async_pendings.add_update(
+                    acct, cont, float(kwargs['timestamp']), 'unlinks'
+                )
             elif redirects:
                 # erase any previous successes
                 update.pop('successes', None)
@@ -832,7 +878,7 @@ class ObjectUpdater(Daemon):
                 self.logger.debug('Update failed for %(path)s %(update_path)s',
                                   {'path': path, 'update_path': update_path})
                 self.oldest_async_pendings.add_update(
-                    acct, cont, kwargs['timestamp']
+                    acct, cont, float(kwargs['timestamp']), 'failures'
                 )
                 if new_successes:
                     update['successes'] = successes

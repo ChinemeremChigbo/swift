@@ -341,30 +341,67 @@ class TestObjectUpdaterStats(ReplProbeTest):
         self.int_client = self.make_internal_client()
         self.container_servers = Manager(['container-server'])
 
-    def test_lots_of_asyncs(self):
-        # Create some (acct, cont) pairs
-        num_accounts = 3
-        num_conts_per_a = 4
+    def setup_accounts_and_containers(self, num_accounts,
+                                      num_containers_per_account):
         ac_pairs = []
         for a in range(num_accounts):
             acct = 'AUTH_user%03d' % a
             self.int_client.create_account(acct)
-            for c in range(num_conts_per_a):
+            for c in range(num_containers_per_account):
                 cont = 'cont%03d' % c
                 self.int_client.create_container(acct, cont)
                 ac_pairs.append((acct, cont))
+        return ac_pairs
 
+    def create_and_manage_objects(
+        self, ac_pairs, num_objects_per_container, delete_after_upload=False
+    ):
+        objects = []
+        for acct, cont in ac_pairs:
+            for o in range(num_objects_per_container):
+                obj = 'obj%03d' % o
+                self.int_client.upload_object(BytesIO(b''), acct, cont, obj)
+                objects.append((acct, cont, obj))
+                if delete_after_upload:
+                    self.int_client.delete_object(acct, cont, obj)
+        return objects
+
+    def validate_updater_stats(
+        self, recons, expected_count_key, entry_key, validate_entry=None
+    ):
+        found_counts = []
+        found_entries = set()
+
+        for recon in recons:
+            updater_stats = recon['object_updater_stats']
+            print(updater_stats)
+            count = updater_stats[expected_count_key]
+            found_counts.append(count)
+
+            entries = updater_stats[entry_key]['oldest_entries']
+            for entry in entries:
+                account = entry['account']
+                container = entry['container']
+                timestamp = entry['timestamp']
+                self.assertIsNotNone(timestamp)
+                if validate_entry:
+                    validate_entry(entry)
+                found_entries.add((account, container))
+
+        return found_counts, found_entries
+
+    def test_lots_of_asyncs(self):
+        # Create some (acct, cont) pairs
+        ac_pairs = self.setup_accounts_and_containers(
+            num_accounts=3, num_containers_per_account=4
+        )
         # Shut down a couple container servers
         for n in random.sample([1, 2, 3, 4], 2):
             self.container_servers.stop(number=n)
 
         # Create a bunch of objects
         num_objs_per_ac = 5
-        for acct, cont in ac_pairs:
-            for o in range(num_objs_per_ac):
-                obj = 'obj%03d' % o
-                self.int_client.upload_object(BytesIO(b''), acct, cont, obj)
-
+        self.create_and_manage_objects(ac_pairs, num_objs_per_ac)
         all_asyncs = self.gather_async_pendings()
         # Between 1-2 asyncs per object
         total_objs = num_objs_per_ac * len(ac_pairs)
@@ -373,43 +410,53 @@ class TestObjectUpdaterStats(ReplProbeTest):
 
         # Run the updater and check stats
         Manager(['object-updater']).once()
-        recons = []
-        for onode in self.object_ring.devs:
-            recon = direct_client.direct_get_recon(onode, 'updater/object')
-            recons.append(recon)
-
+        recons = [
+            direct_client.direct_get_recon(node, 'updater/object')
+            for node in self.object_ring.devs
+        ]
         self.assertEqual(4, len(recons))
-        found_counts = []
-        ac_set = set()
-        for recon in recons:
-            updater_stats = recon['object_updater_stats']
 
-            found_counts.append(
-                updater_stats['failures_account_container_count']
-            )
-
-            oldest_count = updater_stats[
-                'failures_oldest_timestamp_account_containers'
-            ]['oldest_count']
-            self.assertEqual(oldest_count, 5)
-
-            ts_ac_entries = updater_stats[
-                'failures_oldest_timestamp_account_containers'
-            ]['oldest_entries']
-            self.assertEqual(len(ts_ac_entries), oldest_count)
-
-            for entry in ts_ac_entries:
-                account = entry['account']
-                container = entry['container']
-                timestamp = entry['timestamp']
-                self.assertIsNotNone(timestamp)
-                ac_set.add((account, container))
+        found_counts, ac_set = self.validate_updater_stats(
+            recons,
+            expected_count_key='failures_account_container_count',
+            entry_key='failures_oldest_timestamp_account_containers'
+        )
 
         for ac in ac_set:
             self.assertIn(ac, set(ac_pairs))
 
         for found_count in found_counts:
             self.assertLessEqual(found_count, len(ac_pairs))
+
+    def test_outdated_unlinks(self):
+        # Create some (acct, cont) pairs
+        ac_pairs = self.setup_accounts_and_containers(
+            num_accounts=3, num_containers_per_account=4
+        )
+        # Shut down a couple container servers
+        for n in random.sample([1, 2, 3, 4], 2):
+            self.container_servers.stop(number=n)
+
+        # Create a bunch of objects
+        num_objs_per_ac = 5
+        self.create_and_manage_objects(
+            ac_pairs, num_objs_per_ac, delete_after_upload=True
+        )
+        # Run the updater and check stats
+        Manager(['object-updater']).once()
+        recons = [
+            direct_client.direct_get_recon(node, 'updater/object')
+            for node in self.object_ring.devs
+        ]
+        self.assertEqual(4, len(recons))
+
+        total_outdated_unlinks, _ = self.validate_updater_stats(
+            recons,
+            expected_count_key='outdated_unlinks_account_container_counts',
+            entry_key='outdated_unlinks_timestamp_account_containers'
+        )
+
+        self.assertGreaterEqual(total_outdated_unlinks, 1)
 
 
 if __name__ == '__main__':
