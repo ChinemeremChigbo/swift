@@ -22,6 +22,7 @@ import sys
 import time
 import uuid
 from random import random, shuffle
+from sortedcontainers import SortedDict
 from collections import deque
 
 from eventlet import spawn, Timeout
@@ -215,6 +216,144 @@ class BucketizedUpdateSkippingLimiter(object):
     __next__ = next
 
 
+class AccountContainerOldestAsyncPendingManager:
+    """
+    Manages the tracking of the oldest async pending updates for each
+    account-container pair.
+
+    This class maintains timestamps for pending updates associated with
+    account-container pairs. It evicts the newest pairs when the
+    max_account_container_count is reached. It supports retrieving the N
+    oldest pending updates or calculating the age of the oldest pending update.
+
+    The manager works as follows:
+
+    * For each account-container pair, the pending update's timestamp is only
+      updated if the new timestamp is older.
+    * When the number of tracked account-container pairs exceeds
+      `max_account_container_count`, the newest pairs are evicted to maintain
+      the limit.
+
+    :param max_account_container_count:
+        The maximum number of account-container pairs to track. Once this
+        limit is reached, newer pairs are evicted. Defaults to 100.
+
+    :param account_container_recon_dump_count:
+        The number of account-container pairs to return when fetching the
+        oldest N entries. Defaults to 5.
+
+    :param timestamp_to_account_containers:
+        A `SortedDict` that maps timestamps to sets of account-container pairs.
+
+    :param account_container_to_timestamp:
+        A dictionary that maps account-container pairs to their associated
+        timestamps.
+    """
+    def __init__(
+        self,
+        max_account_container_count=100,
+        account_container_recon_dump_count=5,
+    ):
+        self.max_account_container_count = max_account_container_count
+        self.account_container_recon_dump_count = (
+            account_container_recon_dump_count
+        )
+        self.timestamp_to_account_containers = SortedDict()
+        self.account_container_to_timestamp = {}
+
+    def __eq__(self, other):
+        if isinstance(other, AccountContainerOldestAsyncPendingManager):
+            return (
+                self.max_account_container_count == (
+                    other.max_account_container_count
+                )
+                and self.account_container_recon_dump_count
+                == other.account_container_recon_dump_count
+                and self.timestamp_to_account_containers
+                == other.timestamp_to_account_containers
+                and self.account_container_to_timestamp
+                == other.account_container_to_timestamp
+            )
+        return False
+
+    def add_update(self, account, container, timestamp):
+        account_container = (account, container)
+
+        if account_container in self.account_container_to_timestamp:
+            old_timestamp = self.account_container_to_timestamp[
+                account_container
+            ]
+            # Only replace the existing timestamp if the new one is older
+            if timestamp < old_timestamp:
+                # Remove the account_container from
+                # timestamp_to_account_countainers
+                self.timestamp_to_account_containers[old_timestamp].remove(
+                    account_container
+                )
+                if not self.timestamp_to_account_containers[old_timestamp]:
+                    del self.timestamp_to_account_containers[old_timestamp]
+
+                # Remove the old_timestamp from
+                # account_container_to_timestamp
+                del self.account_container_to_timestamp[account_container]
+
+                # Add the new timestamp
+                if timestamp not in self.timestamp_to_account_containers:
+                    self.timestamp_to_account_containers[timestamp] = set()
+
+                self.timestamp_to_account_containers[timestamp].add(
+                    account_container
+                )
+                self.account_container_to_timestamp[account_container] = (
+                    timestamp
+                )
+        else:
+            if timestamp not in self.timestamp_to_account_containers:
+                self.timestamp_to_account_containers[timestamp] = set()
+
+            self.timestamp_to_account_containers[timestamp].add(
+                account_container
+            )
+            self.account_container_to_timestamp[account_container] = timestamp
+
+        # Check size and evict newest account_container(s) if necessary
+        if (
+            len(self.account_container_to_timestamp)
+            > self.max_account_container_count
+        ):
+            newest_account_containers = (
+                self.timestamp_to_account_containers.popitem(-1)[1]
+            )
+            for newest_account_container in newest_account_containers:
+                del self.account_container_to_timestamp[
+                    newest_account_container
+                ]
+
+    def get_n_oldest_timestamp_account_containers(self, n=None):
+        if n is None:
+            n = self.account_container_recon_dump_count
+        oldest_timestamp_account_containers = []
+        for (
+            timestamp,
+            account_containers,
+        ) in self.timestamp_to_account_containers.items():
+            for account_container in account_containers:
+                oldest_timestamp_account_containers.append(
+                    (timestamp, account_container)
+                )
+                if len(oldest_timestamp_account_containers) == n:
+                    return oldest_timestamp_account_containers
+        return oldest_timestamp_account_containers
+
+    def get_oldest_timestamp_age(self):
+        if self.timestamp_to_account_containers:
+            oldest_timestamp = float(
+                self.timestamp_to_account_containers.keys()[0]
+            )
+            return time.time() - oldest_timestamp
+        return float('inf')
+
+
 class SweepStats(object):
     """
     Stats bucket for an update sweep
@@ -229,7 +368,10 @@ class SweepStats(object):
         skips / (skips + successes + failures)
     """
     def __init__(self, errors=0, failures=0, quarantines=0, successes=0,
-                 unlinks=0, redirects=0, skips=0, deferrals=0, drains=0):
+                 unlinks=0, redirects=0, skips=0, deferrals=0, drains=0,
+                 oldest_async_pendings=(
+                     AccountContainerOldestAsyncPendingManager()
+                 )):
         self.errors = errors
         self.failures = failures
         self.quarantines = quarantines
@@ -239,11 +381,13 @@ class SweepStats(object):
         self.skips = skips
         self.deferrals = deferrals
         self.drains = drains
+        self.oldest_async_pendings = oldest_async_pendings
 
     def copy(self):
         return type(self)(self.errors, self.failures, self.quarantines,
                           self.successes, self.unlinks, self.redirects,
-                          self.skips, self.deferrals, self.drains)
+                          self.skips, self.deferrals, self.drains,
+                          self.oldest_async_pendings)
 
     def since(self, other):
         return type(self)(self.errors - other.errors,
@@ -254,7 +398,9 @@ class SweepStats(object):
                           self.redirects - other.redirects,
                           self.skips - other.skips,
                           self.deferrals - other.deferrals,
-                          self.drains - other.drains)
+                          self.drains - other.drains,
+                          self.oldest_async_pendings
+                          )
 
     def reset(self):
         self.errors = 0
@@ -266,6 +412,9 @@ class SweepStats(object):
         self.skips = 0
         self.deferrals = 0
         self.drains = 0
+        self.oldest_async_pendings = (
+            AccountContainerOldestAsyncPendingManager()
+        )
 
     def __str__(self):
         keys = (
@@ -278,8 +427,15 @@ class SweepStats(object):
             (self.skips, 'skips'),
             (self.deferrals, 'deferrals'),
             (self.drains, 'drains'),
+            (
+                self.oldest_async_pendings.get_oldest_timestamp_age(),
+                'oldest age (seconds)'
+            ),
         )
-        return ', '.join('%d %s' % pair for pair in keys)
+        return ', '.join(
+            '%d %s' % pair if isinstance(pair[0], int) else '%s %s' % pair
+            for pair in keys
+        )
 
 
 def split_update_path(update):
@@ -333,7 +489,27 @@ class ObjectUpdater(Daemon):
         self.recon_cache_path = conf.get('recon_cache_path',
                                          DEFAULT_RECON_CACHE_PATH)
         self.rcache = os.path.join(self.recon_cache_path, RECON_OBJECT_FILE)
-        self.stats = SweepStats()
+        default_manager = AccountContainerOldestAsyncPendingManager()
+        max_account_container_count = config_positive_int_value(
+            conf.get(
+                'max_account_container_count',
+                default_manager.max_account_container_count,
+            )
+        )
+        account_container_recon_dump_count = config_positive_int_value(
+            conf.get(
+                'account_container_recon_dump_count',
+                default_manager.account_container_recon_dump_count,
+            )
+        )
+        self.stats = SweepStats(
+            oldest_async_pendings=AccountContainerOldestAsyncPendingManager(
+                max_account_container_count=max_account_container_count,
+                account_container_recon_dump_count=(
+                    account_container_recon_dump_count
+                ),
+            )
+        )
         self.max_deferred_updates = non_negative_int(
             conf.get('max_deferred_updates', 10000))
         self.begin = time.time()
@@ -398,8 +574,29 @@ class ObjectUpdater(Daemon):
             elapsed = time.time() - self.begin
             self.logger.info('Object update sweep completed: %.02fs',
                              elapsed)
-            dump_recon_cache({'object_updater_sweep': elapsed},
-                             self.rcache, self.logger)
+            object_updater_stats = {
+                'async_pending_oldest_age_seconds': (
+                    self.stats.oldest_async_pendings.get_oldest_timestamp_age()
+                ),
+                'async_pending_account_container_count': (
+                    len(
+                        self.stats.oldest_async_pendings
+                            .account_container_to_timestamp
+                    )
+                ),
+                'async_pending_oldest_timestamp_account_containers': (
+                    self.stats.oldest_async_pendings
+                        .get_n_oldest_timestamp_account_containers()
+                ),
+            }
+            dump_recon_cache(
+                {
+                    'object_updater_sweep': elapsed,
+                    'object_updater_stats': object_updater_stats,
+                },
+                self.rcache,
+                self.logger,
+            )
             if elapsed < self.interval:
                 time.sleep(self.interval - elapsed)
 
@@ -423,8 +620,29 @@ class ObjectUpdater(Daemon):
             ('Object update single-threaded sweep completed: '
              '%(elapsed).02fs, %(stats)s'),
             {'elapsed': elapsed, 'stats': self.stats})
-        dump_recon_cache({'object_updater_sweep': elapsed},
-                         self.rcache, self.logger)
+        object_updater_stats = {
+            'async_pending_oldest_age_seconds': (
+                self.stats.oldest_async_pendings.get_oldest_timestamp_age()
+            ),
+            'async_pending_account_container_count': (
+                len(
+                    self.stats.oldest_async_pendings
+                        .account_container_to_timestamp
+                )
+            ),
+            'async_pending_oldest_timestamp_account_containers': (
+                self.stats.oldest_async_pendings
+                    .get_n_oldest_timestamp_account_containers()
+            ),
+        }
+        dump_recon_cache(
+            {
+                'object_updater_sweep': elapsed,
+                'object_updater_stats': object_updater_stats,
+            },
+            self.rcache,
+            self.logger,
+        )
 
     def _load_update(self, device, update_path):
         try:
@@ -682,6 +900,9 @@ class ObjectUpdater(Daemon):
                 self.logger.increment('failures')
                 self.logger.debug('Update failed for %(obj)s %(path)s',
                                   {'obj': obj, 'path': update_path})
+                self.stats.oldest_async_pendings.add_update(
+                    acct, cont, kwargs["timestamp"]
+                )
                 if new_successes:
                     update['successes'] = successes
                     rewrite_pickle = True

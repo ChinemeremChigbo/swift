@@ -140,6 +140,14 @@ class TestObjectUpdater(unittest.TestCase):
         self.assertEqual(daemon.max_objects_per_container_per_second, 0.0)
         self.assertEqual(daemon.per_container_ratelimit_buckets, 1000)
         self.assertEqual(daemon.max_deferred_updates, 10000)
+        self.assertEqual(
+            daemon.stats.oldest_async_pendings
+            .max_account_container_count, 100
+        )
+        self.assertEqual(
+            daemon.stats.oldest_async_pendings
+            .account_container_recon_dump_count, 5
+        )
 
         # non-defaults
         conf = {
@@ -153,6 +161,8 @@ class TestObjectUpdater(unittest.TestCase):
             'max_objects_per_container_per_second': '1.2',
             'per_container_ratelimit_buckets': '100',
             'max_deferred_updates': '0',
+            'max_account_container_count': '200',
+            'account_container_recon_dump_count': '10',
         }
         daemon = object_updater.ObjectUpdater(conf, logger=self.logger)
         self.assertEqual(daemon.devices, '/some/where/else')
@@ -165,6 +175,14 @@ class TestObjectUpdater(unittest.TestCase):
         self.assertEqual(daemon.max_objects_per_container_per_second, 1.2)
         self.assertEqual(daemon.per_container_ratelimit_buckets, 100)
         self.assertEqual(daemon.max_deferred_updates, 0)
+        self.assertEqual(
+            daemon.stats.oldest_async_pendings
+            .max_account_container_count, 200
+        )
+        self.assertEqual(
+            daemon.stats.oldest_async_pendings
+            .account_container_recon_dump_count, 10
+        )
 
         # check deprecated option
         daemon = object_updater.ObjectUpdater({'slowdown': '0.04'},
@@ -189,6 +207,8 @@ class TestObjectUpdater(unittest.TestCase):
         check_bad({'max_deferred_updates': '-1'})
         check_bad({'max_deferred_updates': '1.1'})
         check_bad({'max_deferred_updates': 'auto'})
+        check_bad({'max_account_container_count': '-10'})
+        check_bad({'account_container_recon_dump_count': '-5'})
 
     @mock.patch('os.listdir')
     def test_listdir_with_exception(self, mock_listdir):
@@ -2157,32 +2177,169 @@ class TestRateLimiterBucket(unittest.TestCase):
         self.assertEqual([b2, b1], [buckets.get_nowait() for _ in range(2)])
 
 
+class TestAccountContainerOldestAsyncPendingManager(unittest.TestCase):
+    def setUp(self):
+        self.manager = (
+            object_updater.AccountContainerOldestAsyncPendingManager(
+                max_account_container_count=3,
+                account_container_recon_dump_count=2,
+            )
+        )
+
+    def test_add_update_new_pair(self):
+        self.manager.add_update('account1', 'container1', 1000)
+        self.assertEqual(
+            self.manager.account_container_to_timestamp[
+                ('account1', 'container1')
+            ],
+            1000,
+        )
+        self.assertIn(1000, self.manager.timestamp_to_account_containers)
+
+    def test_add_update_existing_pair(self):
+        self.manager.add_update('account1', 'container1', 1000)
+        self.manager.add_update('account1', 'container1', 900)
+        self.assertEqual(
+            self.manager.account_container_to_timestamp[
+                ('account1', 'container1')
+            ], 900
+        )
+        self.assertNotIn(1000, self.manager.timestamp_to_account_containers)
+
+        self.manager.add_update('account1', 'container1', 1100)
+        self.assertEqual(
+            self.manager.account_container_to_timestamp[
+                ('account1', 'container1')
+            ], 900
+        )
+
+    def test_evict_newest_pairs_when_limit_exceeded(self):
+        self.manager.add_update('account1', 'container1', 1000)
+        self.manager.add_update('account2', 'container2', 2000)
+        self.manager.add_update('account3', 'container3', 3000)
+
+        self.manager.add_update('account4', 'container4', 4000)
+        self.assertNotIn(
+            ('account4', 'container4'),
+            self.manager.account_container_to_timestamp
+        )
+        self.assertIn(
+            ('account3', 'container3'),
+            self.manager.account_container_to_timestamp
+        )
+
+    def test_get_n_oldest_timestamp_account_containers(self):
+        self.manager.add_update('account1', 'container1', 1000)
+        self.manager.add_update('account2', 'container2', 2000)
+        self.manager.add_update('account3', 'container3', 3000)
+
+        oldest_pairs = (
+            self.manager.get_n_oldest_timestamp_account_containers(2)
+        )
+        self.assertEqual(
+            oldest_pairs,
+            [(1000, ('account1', 'container1')),
+             (2000, ('account2', 'container2'))],
+        )
+
+    def test_get_oldest_timestamp_age(self):
+        current_time = time()
+        self.manager.add_update(
+            'account1', 'container1', current_time - 100
+        )
+        age = self.manager.get_oldest_timestamp_age()
+        self.assertAlmostEqual(age, 100, delta=1)
+
+    def test_empty_oldest_timestamp_age(self):
+        self.assertEqual(self.manager.get_oldest_timestamp_age(), float('inf'))
+
+    def test_eviction_when_multiple_same_timestamps(self):
+        self.manager.add_update('account1', 'container1', 1000)
+        self.manager.add_update('account2', 'container2', 1000)
+        self.manager.add_update('account3', 'container3', 1000)
+
+        self.manager.add_update('account4', 'container4', 500)
+
+        self.assertIn(
+            ('account4', 'container4'),
+            self.manager.account_container_to_timestamp
+        )
+        self.assertEqual(len(self.manager.account_container_to_timestamp), 1)
+
+
 class TestSweepStats(unittest.TestCase):
     def test_copy(self):
-        num_props = len(vars(object_updater.SweepStats()))
-        stats = object_updater.SweepStats(*range(1, num_props + 1))
+        oldest_async_pending = (
+            object_updater.AccountContainerOldestAsyncPendingManager(
+                max_account_container_count=10,
+                account_container_recon_dump_count=11
+            )
+        )
+        stats = object_updater.SweepStats(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, oldest_async_pending,
+        )
         stats2 = stats.copy()
         self.assertEqual(vars(stats), vars(stats2))
+        self.assertEqual(
+            stats.oldest_async_pendings, stats2.oldest_async_pendings
+        )
 
     def test_since(self):
-        stats = object_updater.SweepStats(1, 2, 3, 4, 5, 6, 7, 8, 9)
-        stats2 = object_updater.SweepStats(4, 6, 8, 10, 12, 14, 16, 18, 20)
-        expected = object_updater.SweepStats(3, 4, 5, 6, 7, 8, 9, 10, 11)
+        oldest_async_pendings = (
+            object_updater.AccountContainerOldestAsyncPendingManager(
+                max_account_container_count=10,
+                account_container_recon_dump_count=11
+            )
+        )
+        oldest_async_pendings2 = (
+            object_updater.AccountContainerOldestAsyncPendingManager(
+                max_account_container_count=22,
+                account_container_recon_dump_count=24
+            )
+        )
+
+        stats = object_updater.SweepStats(
+            1, 2, 3, 4, 5, 6, 7, 8, 9,
+            oldest_async_pendings=oldest_async_pendings
+        )
+        stats2 = object_updater.SweepStats(
+            4, 6, 8, 10, 12, 14, 16, 18, 20,
+            oldest_async_pendings=oldest_async_pendings2
+        )
+        expected = object_updater.SweepStats(
+            3, 4, 5, 6, 7, 8, 9, 10, 11,
+            oldest_async_pendings=oldest_async_pendings2
+        )
         self.assertEqual(vars(expected), vars(stats2.since(stats)))
 
     def test_reset(self):
-        num_props = len(vars(object_updater.SweepStats()))
-        stats = object_updater.SweepStats(*range(1, num_props + 1))
+        oldest_async_pending = (
+            object_updater.AccountContainerOldestAsyncPendingManager(
+                max_account_container_count=10,
+                account_container_recon_dump_count=11
+            )
+        )
+        stats = object_updater.SweepStats(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, oldest_async_pending,
+        )
         stats.reset()
         expected = object_updater.SweepStats()
         self.assertEqual(vars(expected), vars(stats))
 
     def test_str(self):
-        num_props = len(vars(object_updater.SweepStats()))
-        stats = object_updater.SweepStats(*range(1, num_props + 1))
+        oldest_async_pending = (
+            object_updater.AccountContainerOldestAsyncPendingManager(
+                max_account_container_count=10,
+                account_container_recon_dump_count=11
+            )
+        )
+        stats = object_updater.SweepStats(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, oldest_async_pending,
+        )
         self.assertEqual(
             '4 successes, 2 failures, 3 quarantines, 5 unlinks, 1 errors, '
-            '6 redirects, 7 skips, 8 deferrals, 9 drains', str(stats))
+            '6 redirects, 7 skips, 8 deferrals, 9 drains, inf oldest age '
+            '(seconds)', str(stats))
 
 
 if __name__ == '__main__':
