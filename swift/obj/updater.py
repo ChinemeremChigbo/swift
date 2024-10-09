@@ -229,7 +229,8 @@ class SweepStats(object):
         skips / (skips + successes + failures)
     """
     def __init__(self, errors=0, failures=0, quarantines=0, successes=0,
-                 unlinks=0, redirects=0, skips=0, deferrals=0, drains=0):
+                 unlinks=0, redirects=0, skips=0, deferrals=0, drains=0,
+                 oldest_failed_update=None):
         self.errors = errors
         self.failures = failures
         self.quarantines = quarantines
@@ -239,13 +240,20 @@ class SweepStats(object):
         self.skips = skips
         self.deferrals = deferrals
         self.drains = drains
+        self.oldest_failed_update = oldest_failed_update
 
     def copy(self):
         return type(self)(self.errors, self.failures, self.quarantines,
                           self.successes, self.unlinks, self.redirects,
-                          self.skips, self.deferrals, self.drains)
+                          self.skips, self.deferrals, self.drains,
+                          self.oldest_failed_update)
 
     def since(self, other):
+        oldest_failed_update = min(
+            self.oldest_failed_update or float('inf'),
+            other.oldest_failed_update or float('inf')
+        ) if self.oldest_failed_update or other.oldest_failed_update else None
+
         return type(self)(self.errors - other.errors,
                           self.failures - other.failures,
                           self.quarantines - other.quarantines,
@@ -254,7 +262,8 @@ class SweepStats(object):
                           self.redirects - other.redirects,
                           self.skips - other.skips,
                           self.deferrals - other.deferrals,
-                          self.drains - other.drains)
+                          self.drains - other.drains,
+                          oldest_failed_update)
 
     def reset(self):
         self.errors = 0
@@ -266,6 +275,7 @@ class SweepStats(object):
         self.skips = 0
         self.deferrals = 0
         self.drains = 0
+        self.oldest_failed_update = None
 
     def __str__(self):
         keys = (
@@ -279,7 +289,12 @@ class SweepStats(object):
             (self.deferrals, 'deferrals'),
             (self.drains, 'drains'),
         )
-        return ', '.join('%d %s' % pair for pair in keys)
+        result = ', '.join('%d %s' % pair for pair in keys)
+        if self.oldest_failed_update:
+            result += ", oldest failed update: %s" % self.oldest_failed_update
+        else:
+            result += ", no failed updates"
+        return result
 
 
 def split_update_path(update):
@@ -530,7 +545,13 @@ class ObjectUpdater(Daemon):
                     else:
                         last_obj_hash = obj_hash
                         update = self._load_update(device, update_path)
-                        if update is not None:
+                        if update is None:
+                            if (
+                                not self.stats.oldest_failed_update
+                                or timestamp < self.stats.oldest_failed_update
+                            ):
+                                self.stats.oldest_failed_update = timestamp
+                        else:
                             yield {'device': device,
                                    'policy': policy,
                                    'update_path': update_path,
@@ -588,6 +609,7 @@ class ObjectUpdater(Daemon):
              '%(skips)d skips, '
              '%(deferrals)d deferrals, '
              '%(drains)d drains '
+             'oldest_failed_update: %(oldest_failed_update)s '
              '(pid: %(pid)d)'),
             {'device': device,
              'elapsed': time.time() - start_time,
@@ -600,7 +622,8 @@ class ObjectUpdater(Daemon):
              'redirects': sweep_totals.redirects,
              'skips': sweep_totals.skips,
              'deferrals': sweep_totals.deferrals,
-             'drains': sweep_totals.drains
+             'drains': sweep_totals.drains,
+             'oldest_failed_update': self.stats.oldest_failed_update
              })
 
     def process_object_update(self, update_path, device, policy, update,
