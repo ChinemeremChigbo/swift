@@ -625,9 +625,9 @@ class ObjectUpdater(Daemon):
             headers_out.setdefault('X-Backend-Accept-Quoted-Location', 'true')
             acct, cont = split_update_path(update)
             part, nodes = self.get_container_ring().get_nodes(acct, cont)
-            obj = '/%s/%s/%s' % (acct, cont, update['obj'])
+            obj_path = '/%s/%s/%s' % (acct, cont, update['obj'])
             events = [spawn(self.object_update,
-                            node, part, update['op'], obj, headers_out)
+                            node, part, update['op'], obj_path, headers_out)
                       for node in nodes if node['id'] not in successes]
             success = True
             new_successes = rewrite_pickle = False
@@ -647,7 +647,7 @@ class ObjectUpdater(Daemon):
                 self.stats.successes += 1
                 self.logger.increment('successes')
                 self.logger.debug('Update sent for %(obj)s %(path)s',
-                                  {'obj': obj, 'path': update_path})
+                                  {'obj': obj_path, 'path': update_path})
                 self.stats.unlinks += 1
                 self.logger.increment('unlinks')
                 os.unlink(update_path)
@@ -674,14 +674,14 @@ class ObjectUpdater(Daemon):
                 self.logger.increment("redirects")
                 self.logger.debug(
                     'Update redirected for %(obj)s %(path)s to %(shard)s',
-                    {'obj': obj, 'path': update_path,
+                    {'obj': obj_path, 'path': update_path,
                      'shard': update['container_path']})
                 rewrite_pickle = True
             else:
                 self.stats.failures += 1
                 self.logger.increment('failures')
                 self.logger.debug('Update failed for %(obj)s %(path)s',
-                                  {'obj': obj, 'path': update_path})
+                                  {'obj': obj_path, 'path': update_path})
                 if new_successes:
                     update['successes'] = successes
                     rewrite_pickle = True
