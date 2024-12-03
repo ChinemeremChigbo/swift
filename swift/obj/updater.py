@@ -21,6 +21,7 @@ import signal
 import sys
 import time
 import uuid
+import json
 from random import random, shuffle
 from bisect import insort
 from collections import deque
@@ -477,6 +478,8 @@ class ObjectUpdater(Daemon):
             self.logger.info('Begin object update sweep')
             self.begin = time.time()
             pids = []
+            pipe_map = {}
+            updates = []
             # read from container ring to ensure it's fresh
             self.get_container_ring().get_nodes('')
             for device in self._listdir(self.devices):
@@ -489,19 +492,24 @@ class ObjectUpdater(Daemon):
                     # so a simple warning is sufficient.
                     self.logger.warning('Skipping: %s', err)
                     continue
+                pipe_read_fd, pipe_write_fd = os.pipe()
+                pipe_map[device] = pipe_read_fd
                 while len(pids) >= self.updater_workers:
                     pids.remove(os.wait()[0])
+                    os.close(pipe_write_fd)
                 pid = os.fork()
                 if pid:
                     pids.append(pid)
+                    os.close(pipe_write_fd)
                 else:
+                    os.close(pipe_read_fd)
                     signal.signal(signal.SIGTERM, signal.SIG_DFL)
                     os.environ.pop('NOTIFY_SOCKET', None)
                     eventlet_monkey_patch()
                     self.stats.reset()
                     self.oldest_async_pendings.reset()
                     forkbegin = time.time()
-                    self.object_sweep(dev_path)
+                    self.object_sweep(dev_path, pipe_write_fd)
                     elapsed = time.time() - forkbegin
                     self.logger.info(
                         ('Object update sweep of %(device)s '
@@ -511,6 +519,28 @@ class ObjectUpdater(Daemon):
                     sys.exit()
             while pids:
                 pids.remove(os.wait()[0])
+            for pipe_fd in pipe_map.values():
+                with os.fdopen(pipe_fd, 'r') as pipe_reader:
+                    for line in pipe_reader:
+                        try:
+                            update = json.loads(line)
+                            updates.append(update)
+                        except Exception as e:
+                            self.logger.error(
+                                "Error processing pipe update: %s", e)
+                os.close(pipe_fd)
+            for update in updates:
+                try:
+                    acct, cont, timestamp = (
+                        update['acct'],
+                        update['cont'],
+                        update['timestamp'],
+                    )
+                    self.oldest_async_pendings.add_update(
+                        acct, cont, timestamp
+                    )
+                except Exception as e:
+                    self.logger.error("Error processing update: %s", e)
             elapsed = time.time() - self.begin
             self.logger.info('Object update sweep completed: %.02fs',
                              elapsed)
@@ -683,7 +713,7 @@ class ObjectUpdater(Daemon):
                                    'timestamp': timestamp,
                                    'update': update}
 
-    def object_sweep(self, device):
+    def object_sweep(self, device, pipe_write_fd=None):
         """
         If there are async pendings on the device, walk each one and update.
 
@@ -707,7 +737,8 @@ class ObjectUpdater(Daemon):
             drain_until=self.begin + self.interval)
         with ContextPool(self.concurrency) as pool:
             for update_ctx in ap_iter:
-                pool.spawn(self.process_object_update, **update_ctx)
+                pool.spawn(self._process_and_pipe_update,
+                           update_ctx, pipe_write_fd)
                 now = time.time()
                 if now - last_status_update >= self.report_interval:
                     this_sweep = self.stats.since(start_stats)
@@ -750,6 +781,38 @@ class ObjectUpdater(Daemon):
              'deferrals': sweep_totals.deferrals,
              'drains': sweep_totals.drains
              })
+
+    def _process_and_pipe_update(self, update_ctx, pipe_write_fd):
+        """
+        Process an object update and optionally write to a pipe.
+
+        :param update_ctx: context for the update
+        :param pipe_write_fd: file descriptor for the pipe to write updates
+        """
+        try:
+            if pipe_write_fd is None:
+                self.process_object_update(**update_ctx)
+            else:
+                update_ctx['device_object_updater_stats'] = {}
+                self.process_object_update(**update_ctx)
+                if all(
+                    keys in update_ctx['device_object_updater_stats']
+                    for keys in ['account', 'container', 'timestamp']
+                ):
+                    update_data = {
+                        'acct': update_ctx[
+                            'device_object_updater_stats']['account'],
+                        'cont': update_ctx[
+                            'device_object_updater_stats']['container'],
+                        'timestamp': update_ctx[
+                            'device_object_updater_stats']['timestamp'],
+                    }
+                    os.write(
+                        pipe_write_fd,
+                        (json.dumps(update_data) + '\n').encode('utf-8')
+                    )
+        except Exception as e:
+            self.logger.error("Error processing update: %s", e)
 
     def process_object_update(self, update_path, device, policy, update,
                               **kwargs):
@@ -831,9 +894,11 @@ class ObjectUpdater(Daemon):
                 self.logger.increment('failures')
                 self.logger.debug('Update failed for %(path)s %(update_path)s',
                                   {'path': path, 'update_path': update_path})
-                self.oldest_async_pendings.add_update(
-                    acct, cont, kwargs['timestamp']
-                )
+                kwargs['device_object_updater_stats'] = {
+                    'account': acct,
+                    'container': cont,
+                    'timestamp': kwargs['timestamp']
+                }
                 if new_successes:
                     update['successes'] = successes
                     rewrite_pickle = True
