@@ -40,6 +40,7 @@ from eventlet.green import httplib
 
 from swift import __version__ as swift_version
 from swift.common.http import is_success
+from swift.common.constraints import check_drive
 from test import listen_zero, BaseTestCase
 from test.debug_logger import debug_logger
 from test.unit import mocked_http_conn, \
@@ -1091,7 +1092,8 @@ class TestObjectController(BaseTestCase):
             mock_ring.get_nodes.return_value = (99, [node])
             object_updater.container_ring = mock_ring
             mock_update.return_value = ((True, 1, None))
-            object_updater.run_once()
+            dev_path = check_drive(self.testdir, 'sda1', False)
+            object_updater._process_device_in_child(dev_path, 'sda1')
         self.assertEqual(1, mock_update.call_count)
         self.assertEqual((node, 99, 'PUT', '/a/c/o'),
                          mock_update.call_args_list[0][0][0:4])
@@ -1206,7 +1208,8 @@ class TestObjectController(BaseTestCase):
                 mock_ring = mock.MagicMock()
                 mock_ring.get_nodes.return_value = (99, [node])
                 object_updater.container_ring = mock_ring
-                object_updater.run_once()
+                dev_path = check_drive(self.testdir, 'sda1', False)
+                object_updater._process_device_in_child(dev_path, 'sda1')
 
         self.assertEqual(1, len(conn.requests))
         self.assertEqual('/cdevice/99/.sharded_a/c_shard_1/o',

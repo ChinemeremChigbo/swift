@@ -35,7 +35,7 @@ from swift.common.utils import get_logger, renamer, write_pickle, \
     dump_recon_cache, config_true_value, RateLimitedIterator, split_path, \
     eventlet_monkey_patch, get_redirect_data, ContextPool, hash_path, \
     non_negative_float, config_positive_int_value, non_negative_int, \
-    EventletRateLimiter, node_to_string, parse_options
+    EventletRateLimiter, node_to_string, parse_options, load_recon_cache
 from swift.common.daemon import Daemon, run_daemon
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import split_policy_string, PolicyError
@@ -476,45 +476,11 @@ class ObjectUpdater(Daemon):
         while True:
             self.logger.info('Begin object update sweep')
             self.begin = time.time()
-            pids = []
-            # read from container ring to ensure it's fresh
-            self.get_container_ring().get_nodes('')
-            for device in self._listdir(self.devices):
-                try:
-                    dev_path = check_drive(self.devices, device,
-                                           self.mount_check)
-                except ValueError as err:
-                    # We don't count this as an error. The occasional
-                    # unmounted drive is part of normal cluster operations,
-                    # so a simple warning is sufficient.
-                    self.logger.warning('Skipping: %s', err)
-                    continue
-                while len(pids) >= self.updater_workers:
-                    pids.remove(os.wait()[0])
-                pid = os.fork()
-                if pid:
-                    pids.append(pid)
-                else:
-                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
-                    os.environ.pop('NOTIFY_SOCKET', None)
-                    eventlet_monkey_patch()
-                    self.stats.reset()
-                    self.oldest_async_pendings.reset()
-                    forkbegin = time.time()
-                    self.object_sweep(dev_path)
-                    elapsed = time.time() - forkbegin
-                    self.logger.info(
-                        ('Object update sweep of %(device)s '
-                         'completed: %(elapsed).02fs, %(stats)s'),
-                        {'device': device, 'elapsed': elapsed,
-                         'stats': self.stats})
-                    sys.exit()
-            while pids:
-                pids.remove(os.wait()[0])
+            self._process_devices()
             elapsed = time.time() - self.begin
             self.logger.info('Object update sweep completed: %.02fs',
                              elapsed)
-            self.dump_recon(elapsed)
+            self.aggregate_and_dump_recon(elapsed)
             if elapsed < self.interval:
                 time.sleep(self.interval - elapsed)
 
@@ -524,48 +490,135 @@ class ObjectUpdater(Daemon):
         self.begin = time.time()
         self.stats.reset()
         self.oldest_async_pendings.reset()
-        for device in self._listdir(self.devices):
-            try:
-                dev_path = check_drive(self.devices, device, self.mount_check)
-            except ValueError as err:
-                # We don't count this as an error. The occasional unmounted
-                # drive is part of normal cluster operations, so a simple
-                # warning is sufficient.
-                self.logger.warning('Skipping: %s', err)
-                continue
-            self.object_sweep(dev_path)
+        self._process_devices()
         elapsed = time.time() - self.begin
         self.logger.info(
             ('Object update single-threaded sweep completed: '
              '%(elapsed).02fs, %(stats)s'),
             {'elapsed': elapsed, 'stats': self.stats})
-        self.dump_recon(elapsed)
+        self.aggregate_and_dump_recon(elapsed)
 
-    def dump_recon(self, elapsed):
-        """Gathers stats and dumps recon cache."""
-        object_updater_stats = {
-            'failures_oldest_timestamp': (
-                self.oldest_async_pendings.get_oldest_timestamp()
-            ),
-            'failures_oldest_timestamp_age': (
-                self.oldest_async_pendings.get_oldest_timestamp_age()
-            ),
-            'failures_account_container_count': (
-                len(self.oldest_async_pendings.ac_to_timestamp)
-            ),
-            'failures_oldest_timestamp_account_containers': (
+    def _process_devices(self):
+        """Process devices, handling both single and multi-threaded modes."""
+        pids = []
+        # read from container ring to ensure it's fresh
+        self.get_container_ring().get_nodes('')
+        self._all_local_devices = self._listdir(self.devices)
+        for device in self._all_local_devices:
+            try:
+                dev_path = check_drive(self.devices, device,
+                                       self.mount_check)
+            except ValueError as err:
+                # We don't count this as an error. The occasional
+                # unmounted drive is part of normal cluster operations,
+                # so a simple warning is sufficient.
+                self.logger.warning('Skipping: %s', err)
+                continue
+            while len(pids) >= self.updater_workers:
+                pids.remove(os.wait()[0])
+            pid = os.fork()
+            if pid:
+                pids.append(pid)
+            else:
+                self._process_device_in_child(dev_path, device)
+                sys.exit()
+
+        while pids:
+            pids.remove(os.wait()[0])
+
+    def _process_device_in_child(self, dev_path, device):
+        """Process a single device in a forked child process."""
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.environ.pop('NOTIFY_SOCKET', None)
+        eventlet_monkey_patch()
+        self.stats.reset()
+        self.oldest_async_pendings.reset()
+        forkbegin = time.time()
+        self.object_sweep(dev_path)
+        elapsed = time.time() - forkbegin
+        self.logger.info(
+            ('Object update sweep of %(device)s '
+                'completed: %(elapsed).02fs, %(stats)s'),
+            {'device': device, 'elapsed': elapsed,
+                'stats': self.stats})
+        self.dump_device_recon(device)
+
+    def _gather_recon_stats(self):
+        """Gather stats common to both device and overall recon dumps."""
+        stats = {
+            'failures_oldest_timestamp':
+                self.oldest_async_pendings.get_oldest_timestamp(),
+            'failures_oldest_timestamp_age':
+                self.oldest_async_pendings.get_oldest_timestamp_age(),
+            'failures_account_container_count':
+                len(self.oldest_async_pendings.ac_to_timestamp),
+            'failures_oldest_timestamp_account_containers':
                 self.oldest_async_pendings.get_n_oldest_timestamp_acs(
-                    self.dump_count
-                )
+                    self.dump_count),
+            'tracker_memory_usage':
+                self.oldest_async_pendings.get_memory_usage(),
+        }
+        return stats
+
+    def dump_device_recon(self, device):
+        """Dump recon stats for a single device."""
+        disk_recon_stats = self._gather_recon_stats()
+        dump_recon_cache(
+            {'object_updater_per_device': {device: disk_recon_stats}},
+            self.rcache,
+            self.logger,
+        )
+
+    def aggregate_and_dump_recon(self, elapsed):
+        """
+        Aggregate recon stats across devices and dump the result to the recon
+        cache.
+        """
+        recon_cache = load_recon_cache(self.rcache)
+        device_stats = recon_cache.get('object_updater_per_device', {})
+
+        devices_to_remove = set(device_stats) - set(self._all_local_devices)
+        if devices_to_remove:
+            for dtr in devices_to_remove:
+                device_stats[dtr] = {}
+
+        aggregated_oldest_entries = []
+
+        for stats in device_stats.values():
+            container_data = stats.get(
+                'failures_oldest_timestamp_account_containers', {})
+            aggregated_oldest_entries.extend(container_data.get(
+                'oldest_entries', []))
+
+        aggregated_oldest_entries = aggregated_oldest_entries[:self.dump_count]
+        aggregated_oldest_count = len(aggregated_oldest_entries)
+
+        aggregated_stats = {
+            'failures_account_container_count': sum(
+                stats.get('failures_account_container_count', 0)
+                for stats in device_stats.values()
             ),
-            'tracker_memory_usage': (
-                self.oldest_async_pendings.get_memory_usage()
+            'tracker_memory_usage': sum(
+                stats.get('tracker_memory_usage', 0)
+                for stats in device_stats.values()
             ),
+            'failures_oldest_timestamp': min(
+                (
+                    stats.get('failures_oldest_timestamp')
+                    for stats in device_stats.values()
+                    if stats.get('failures_oldest_timestamp') is not None
+                ),
+                default=None,
+            ),
+            'failures_oldest_timestamp_account_containers': {
+                'oldest_count': aggregated_oldest_count,
+                'oldest_entries': aggregated_oldest_entries,
+            },
         }
         dump_recon_cache(
             {
                 'object_updater_sweep': elapsed,
-                'object_updater_stats': object_updater_stats,
+                'object_updater_stats': aggregated_stats,
             },
             self.rcache,
             self.logger,

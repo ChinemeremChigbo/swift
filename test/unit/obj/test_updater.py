@@ -27,6 +27,7 @@ from tempfile import mkdtemp
 from shutil import rmtree
 
 from swift.common.exceptions import ConnectionTimeout
+from swift.common.constraints import check_drive
 from test import listen_zero
 from test.debug_logger import debug_logger
 from test.unit import (
@@ -102,6 +103,7 @@ class TestObjectUpdater(unittest.TestCase):
         self.devices_dir = os.path.join(self.testdir, 'devices')
         os.mkdir(self.devices_dir)
         self.sda1 = os.path.join(self.devices_dir, 'sda1')
+        self.dev_path = check_drive(self.devices_dir, 'sda1', False)
         os.mkdir(self.sda1)
         for policy in POLICIES:
             os.mkdir(os.path.join(self.sda1, get_tmp_dir(policy)))
@@ -470,10 +472,10 @@ class TestObjectUpdater(unittest.TestCase):
         ], mock_check_drive.mock_calls)
         self.assertEqual(ou.logger.statsd_client.get_increment_counts(), {})
 
-    @mock.patch('swift.obj.updater.dump_recon_cache')
-    @mock.patch.object(object_updater, 'check_drive')
-    def test_run_once(self, mock_check_drive, mock_dump_recon):
-        mock_check_drive.side_effect = lambda r, d, mc: os.path.join(r, d)
+    @mock.patch('swift.obj.updater.os')
+    def test_run_once_child(self, mock_os):
+        mock_os.path = os.path
+        mock_os.listdir = os.listdir
         ou = object_updater.ObjectUpdater({
             'devices': self.devices_dir,
             'mount_check': 'false',
@@ -481,23 +483,122 @@ class TestObjectUpdater(unittest.TestCase):
             'interval': '1',
             'concurrency': '1',
             'node_timeout': '15'}, logger=self.logger)
+        devices = []
+        NUM_DEVICES = 4
+        for i in range(NUM_DEVICES):
+            device = os.path.join(self.devices_dir, 'sda' + str(i))
+            devices.append(device)
+            async_dir = os.path.join(device, get_async_dir(POLICIES[0]))
+            os.makedirs(async_dir, exist_ok=True)
+
+        mock_os.fork.side_effect = [0]
+        mock_process = ou._process_device_in_child = mock.MagicMock()
+        with self.assertRaises(SystemExit):
+            ou.run_once()
+        self.assertEqual([
+            mock.call(self.dev_path, 'sda1'),
+        ], mock_process.mock_calls)
+
+    @mock.patch.object(object_updater, 'check_drive')
+    @mock.patch('swift.obj.updater.os')
+    def test_run_once_parent_default(self, mock_os, mock_check_drive):
+        mock_os.path = os.path
+        mock_os.listdir = os.listdir
+        ou = object_updater.ObjectUpdater({
+            'devices': self.devices_dir,
+            'mount_check': 'false',
+            'swift_dir': self.testdir,
+            'interval': '1',
+            'concurrency': '1',
+            'node_timeout': '15'}, logger=self.logger)
+
+        devices = []
+        NUM_DEVICES = 2
+        for i in range(NUM_DEVICES):
+            device = os.path.join(self.devices_dir, 'sda' + str(i))
+            devices.append(device)
+            async_dir = os.path.join(device, get_async_dir(POLICIES[0]))
+            os.makedirs(async_dir, exist_ok=True)
+
+        pids = [i + 1 for i in range(NUM_DEVICES)]
+        mock_os.fork.side_effect = pids
+        mock_os.wait.side_effect = [(i, 0) for i in pids]
         ou.run_once()
+        self.assertEqual([
+            mock.call(self.devices_dir, 'sda1', False),
+            mock.call(self.devices_dir, 'sda0', False),
+        ], mock_check_drive.mock_calls)
+        self.assertEqual([
+            mock.call.fork(),
+            mock.call.wait(),
+            mock.call.fork(),
+            mock.call.wait(),
+        ], mock_os.mock_calls)
+
+    @mock.patch.object(object_updater, 'check_drive')
+    @mock.patch('swift.obj.updater.os')
+    def test_run_once_parent_more_updater_workers(self, mock_os,
+                                                  mock_check_drive):
+        # unpatch listdir and path
+        mock_os.path = os.path
+        mock_os.listdir = os.listdir
+        ou = object_updater.ObjectUpdater({
+            'devices': self.devices_dir,
+            'mount_check': 'false',
+            'swift_dir': self.testdir,
+            'updater_workers': '4',
+            'interval': '1',
+            'concurrency': '1',
+            'node_timeout': '15'}, logger=self.logger)
+        devices = []
+        NUM_DEVICES = 4
+        for i in range(NUM_DEVICES):
+            device = os.path.join(self.devices_dir, 'sda' + str(i))
+            devices.append(device)
+            async_dir = os.path.join(device, get_async_dir(POLICIES[0]))
+            os.makedirs(async_dir, exist_ok=True)
+
+        pids = [i + 1 for i in range(NUM_DEVICES)]
+        mock_os.fork.side_effect = pids
+        mock_os.wait.side_effect = [(i, 0) for i in pids]
+        ou.run_once()
+        self.assertEqual([
+            mock.call(self.devices_dir, 'sda1', False),
+            mock.call(self.devices_dir, 'sda0', False),
+            mock.call(self.devices_dir, 'sda2', False),
+            mock.call(self.devices_dir, 'sda3', False),
+        ], mock_check_drive.mock_calls)
+        self.assertEqual([
+            mock.call.fork(),
+            mock.call.fork(),
+            mock.call.fork(),
+            mock.call.fork(),
+            mock.call.wait(),
+            mock.call.wait(),
+            mock.call.wait(),
+            mock.call.wait(),
+        ], mock_os.mock_calls)
+
+    @mock.patch('swift.obj.updater.dump_recon_cache')
+    def test_process_devices_in_child(self, mock_dump_recon):
+        ou = object_updater.ObjectUpdater({
+            'devices': self.devices_dir,
+            'mount_check': 'false',
+            'swift_dir': self.testdir,
+            'interval': '1',
+            'concurrency': '1',
+            'node_timeout': '15'}, logger=self.logger)
+        ou._process_device_in_child(self.dev_path, 'sda1')
         self.assertEqual([], ou.logger.get_lines_for_level('error'))
         async_dir = os.path.join(self.sda1, get_async_dir(POLICIES[0]))
         os.mkdir(async_dir)
-        ou.run_once()
+        ou._process_device_in_child(self.dev_path, 'sda1')
         self.assertTrue(os.path.exists(async_dir))
-        # each run calls check_device
-        self.assertEqual([
-            mock.call(self.devices_dir, 'sda1', False),
-            mock.call(self.devices_dir, 'sda1', False),
-        ], mock_check_drive.mock_calls)
-        mock_check_drive.reset_mock()
         self.assertEqual([], ou.logger.get_lines_for_level('error'))
 
         ou = object_updater.ObjectUpdater({
             'devices': self.devices_dir,
-            'mount_check': 'TrUe',
+            'mount_check': 'true',
             'swift_dir': self.testdir,
             'interval': '1',
             'concurrency': '1',
@@ -505,11 +606,8 @@ class TestObjectUpdater(unittest.TestCase):
         odd_dir = os.path.join(async_dir, 'not really supposed '
                                'to be here')
         os.mkdir(odd_dir)
-        ou.run_once()
+        ou._process_device_in_child(self.dev_path, 'sda1')
         self.assertTrue(os.path.exists(async_dir))
-        self.assertEqual([
-            mock.call(self.devices_dir, 'sda1', True),
-        ], mock_check_drive.mock_calls)
         self.assertEqual([], ou.logger.get_lines_for_level('error'))
 
         ohash = hash_path('a', 'c', 'o')
@@ -529,7 +627,7 @@ class TestObjectUpdater(unittest.TestCase):
                                  'X-Container-Timestamp':
                                  normalize_timestamp(0)}},
                             async_pending)
-        ou.run_once()
+        ou._process_device_in_child(self.dev_path, 'sda1')
         self.assertTrue(not os.path.exists(older_op_path))
         self.assertTrue(os.path.exists(op_path))
         self.assertEqual(ou.logger.statsd_client.get_increment_counts(),
@@ -592,7 +690,7 @@ class TestObjectUpdater(unittest.TestCase):
                 dev['replication_port'] = bindsock.getsockname()[1]
 
         ou.logger._clear()
-        ou.run_once()
+        ou._process_device_in_child(self.dev_path, 'sda1')
         err = event.wait()
         if err:
             raise err
@@ -613,7 +711,7 @@ class TestObjectUpdater(unittest.TestCase):
         # only 1/2 updates succeeds
         event = spawn(accept, [404, 201])
         ou.logger.clear()
-        ou.run_once()
+        ou._process_device_in_child(self.dev_path, 'sda1')
         err = event.wait()
         if err:
             raise err
@@ -635,7 +733,7 @@ class TestObjectUpdater(unittest.TestCase):
         with Timeout(99) as exc, \
                 mock.patch('swift.obj.updater.http_connect') as mock_connect:
             mock_connect.return_value.getresponse.side_effect = exc
-            ou.run_once()
+            ou._process_device_in_child(self.dev_path, 'sda1')
         self.assertTrue(os.path.exists(op_path))
         self.assertEqual(ou.logger.statsd_client.get_increment_counts(),
                          {'failures': 1})
@@ -655,7 +753,7 @@ class TestObjectUpdater(unittest.TestCase):
         with ConnectionTimeout(9) as exc, \
                 mock.patch('swift.obj.updater.http_connect') as mock_connect:
             mock_connect.return_value.getresponse.side_effect = exc
-            ou.run_once()
+            ou._process_device_in_child(self.dev_path, 'sda1')
         self.assertTrue(os.path.exists(op_path))
         self.assertEqual(ou.logger.statsd_client.get_increment_counts(),
                          {'failures': 1})
@@ -674,7 +772,7 @@ class TestObjectUpdater(unittest.TestCase):
         # final update succeeds
         event = spawn(accept, [201])
         ou.logger.clear()
-        ou.run_once()
+        ou._process_device_in_child(self.dev_path, 'sda1')
         err = event.wait()
         if err:
             raise err
@@ -693,6 +791,109 @@ class TestObjectUpdater(unittest.TestCase):
             sorted([
                 (('updater.timing.status.201', mock.ANY), {}),
             ]))
+
+    @mock.patch('swift.obj.updater.dump_recon_cache')
+    @mock.patch.object(object_updater, 'check_drive')
+    def test_run_once_recon_dump(self, mock_check_drive, mock_dump_recon):
+        self.maxDiff = None
+
+        def assert_and_reset_recon_dump(exp):
+            recon_dumps = [
+                call[0][0] for call in mock_dump_recon.call_args_list]
+            for dump in recon_dumps:
+                for _, stats in (
+                        dump.get('object_updater_per_device', {}).items()):
+                    if stats.get('failures_oldest_timestamp'):
+                        stats['failures_oldest_timestamp'] = '{:.5f}'.format(
+                            float(stats['failures_oldest_timestamp'])
+                        )
+                    for entry in stats.get(
+                        'failures_oldest_timestamp_account_containers', {}
+                    ).get('oldest_entries', []):
+                        entry['timestamp'] = '{:.5f}'.format(
+                            float(entry['timestamp']))
+            self.assertEqual([exp], recon_dumps)
+            mock_dump_recon.reset_mock()
+
+        mock_check_drive.side_effect = lambda r, d, mc: os.path.join(r, d)
+        async_dir = os.path.join(self.sda1, get_async_dir(POLICIES[0]))
+        os.mkdir(async_dir)
+
+        ou = object_updater.ObjectUpdater(
+            {
+                'devices': self.devices_dir,
+                'mount_check': 'true',
+                'swift_dir': self.testdir,
+                'interval': '1',
+                'concurrency': '1',
+                'node_timeout': '15',
+            },
+            logger=self.logger,
+        )
+        with mock.patch.object(
+            ou, 'object_update', return_value=(False, 'node-id', None)
+        ):
+            ou._process_device_in_child(self.dev_path, 'sda1')
+        exp_recon_dump = {
+            'object_updater_per_device': {
+                'sda1': {
+                    'failures_account_container_count': 0,
+                    'failures_oldest_timestamp': None,
+                    'failures_oldest_timestamp_account_containers': {
+                        'oldest_count': 0,
+                        'oldest_entries': [],
+                    },
+                    'failures_oldest_timestamp_age': None,
+                    'tracker_memory_usage': mock.ANY,
+                }
+            }
+        }
+        assert_and_reset_recon_dump(exp_recon_dump)
+
+        ts = next(self.ts_iter)
+        ohash = hash_path('a', 'c', 'o')
+        odir = os.path.join(async_dir, ohash[-3:])
+        mkdirs(odir)
+        op_path = os.path.join(odir, '%s-%s' % (ohash, ts.internal))
+        with open(op_path, 'wb') as async_pending:
+            pickle.dump(
+                {
+                    'op': 'PUT',
+                    'account': 'a',
+                    'container': 'c',
+                    'obj': 'o',
+                    'headers': {
+                        'X-Container-Timestamp': normalize_timestamp(0)},
+                },
+                async_pending,
+            )
+        now = float(next(self.ts_iter))
+        with mock.patch('swift.obj.updater.time.time', return_value=now):
+            with mock.patch.object(
+                ou, 'object_update', return_value=(False, 'node-id', None)
+            ):
+                ou._process_device_in_child(self.dev_path, 'sda1')
+        exp_recon_dump = {
+            'object_updater_per_device': {
+                'sda1': {
+                    'failures_account_container_count': 1,
+                    'failures_oldest_timestamp': '{:.5f}'.format(float(ts)),
+                    'failures_oldest_timestamp_account_containers': {
+                        'oldest_count': 1,
+                        'oldest_entries': [
+                            {
+                                'account': 'a',
+                                'container': 'c',
+                                'timestamp': '{:.5f}'.format(float(ts)),
+                            }
+                        ],
+                    },
+                    'failures_oldest_timestamp_age': now - float(ts),
+                    'tracker_memory_usage': mock.ANY,
+                }
+            }
+        }
+        assert_and_reset_recon_dump(exp_recon_dump)
 
     def test_obj_put_legacy_updates(self):
         ts = (normalize_timestamp(t) for t in
@@ -733,7 +934,8 @@ class TestObjectUpdater(unittest.TestCase):
             # run once
             fake_status_codes = [200, 200, 200]
             with mocked_http_conn(*fake_status_codes, give_connect=capture):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
+
             self.assertEqual(len(fake_status_codes), len(request_log))
             for request_args, request_kwargs in request_log:
                 ip, part, method, path, headers, qs, ssl = request_args
@@ -796,7 +998,7 @@ class TestObjectUpdater(unittest.TestCase):
                 200,  # object update conflict
             ]
             with mocked_http_conn(*fake_status_codes, give_connect=capture):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
             self.assertEqual(len(fake_status_codes), len(request_log))
             for request_args, request_kwargs in request_log:
                 ip, part, method, path, headers, qs, ssl = request_args
@@ -910,7 +1112,7 @@ class TestObjectUpdater(unittest.TestCase):
         with mocked_http_conn(
                 *fake_status_codes, headers=fake_headers) as conn:
             with mock.patch('swift.obj.updater.dump_recon_cache'):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
 
         self._check_update_requests(conn.requests[:3], ts_obj, policies[0])
         self._check_update_requests(conn.requests[3:], ts_obj, policies[0])
@@ -945,7 +1147,7 @@ class TestObjectUpdater(unittest.TestCase):
         with mocked_http_conn(
                 507, 200, 507) as conn:
             with mock.patch('swift.obj.updater.dump_recon_cache'):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
 
         self._check_update_requests(conn.requests, ts_obj, policies[0])
         self.assertEqual(['/sda1/0/a/c/o'] * 3,
@@ -967,7 +1169,7 @@ class TestObjectUpdater(unittest.TestCase):
         with mocked_http_conn(
                 *fake_status_codes, headers=fake_headers) as conn:
             with mock.patch('swift.obj.updater.dump_recon_cache'):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
 
         self._check_update_requests(conn.requests[:2], ts_obj, policies[0])
         self._check_update_requests(conn.requests[2:], ts_obj, policies[0])
@@ -1021,7 +1223,7 @@ class TestObjectUpdater(unittest.TestCase):
         with mocked_http_conn(
                 *fake_status_codes, headers=fake_headers) as conn:
             with mock.patch('swift.obj.updater.dump_recon_cache'):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
 
         self._check_update_requests(conn.requests, ts_obj, policies[0])
         self.assertEqual(['/sda1/0/a/c/o'] * 3,
@@ -1094,7 +1296,7 @@ class TestObjectUpdater(unittest.TestCase):
         with mocked_http_conn(
                 *fake_status_codes, headers=fake_headers) as conn:
             with mock.patch('swift.obj.updater.dump_recon_cache'):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
 
         self._check_update_requests(conn.requests, ts_obj, policies[0])
         # only *one* set of redirected requests is attempted per cycle
@@ -1124,7 +1326,7 @@ class TestObjectUpdater(unittest.TestCase):
         with mocked_http_conn(
                 *fake_status_codes, headers=fake_headers) as conn:
             with mock.patch('swift.obj.updater.dump_recon_cache'):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
 
         self._check_update_requests(conn.requests, ts_obj, policies[0])
         self.assertEqual(
@@ -1168,7 +1370,7 @@ class TestObjectUpdater(unittest.TestCase):
         with mocked_http_conn(
                 *fake_status_codes, headers=fake_headers) as conn:
             with mock.patch('swift.obj.updater.dump_recon_cache'):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
         self._check_update_requests(conn.requests[:3], ts_obj, policies[0])
         self._check_update_requests(conn.requests[3:], ts_obj, policies[0])
         # only *one* set of redirected requests is attempted per cycle
@@ -1202,7 +1404,7 @@ class TestObjectUpdater(unittest.TestCase):
         with mocked_http_conn(
                 *fake_status_codes, headers=fake_headers) as conn:
             with mock.patch('swift.obj.updater.dump_recon_cache'):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
         self._check_update_requests(conn.requests[:3], ts_obj, policies[0])
         self._check_update_requests(conn.requests[3:], ts_obj, policies[0])
         # first try the previously persisted container path, response to that
@@ -1235,7 +1437,7 @@ class TestObjectUpdater(unittest.TestCase):
         with mocked_http_conn(
                 *fake_status_codes, headers=fake_headers) as conn:
             with mock.patch('swift.obj.updater.dump_recon_cache'):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
         self._check_update_requests(conn.requests, ts_obj, policies[0])
         self.assertEqual(
             ['/sda1/%s/.shards_a/c_shard_3/o' % shard_3_part] * 3 +
@@ -1260,7 +1462,7 @@ class TestObjectUpdater(unittest.TestCase):
         with mocked_http_conn(
                 *fake_status_codes, headers=fake_headers) as conn:
             with mock.patch('swift.obj.updater.dump_recon_cache'):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
         self._check_update_requests(conn.requests, ts_obj, policies[0])
         self.assertEqual(['/sda1/%s/a/c/o' % root_part] * 3,
                          [req['path'] for req in conn.requests])
@@ -1295,7 +1497,7 @@ class TestObjectUpdater(unittest.TestCase):
 
         with mocked_http_conn():
             with mock.patch('swift.obj.updater.dump_recon_cache'):
-                daemon.run_once()
+                daemon._process_device_in_child(self.dev_path, 'sda1')
 
         self.assertEqual(
             {'quarantines': 1},
@@ -1393,7 +1595,7 @@ class TestObjectUpdater(unittest.TestCase):
         expected_success = 2
         fake_status_codes = [200] * 3 * expected_success
         with mocked_http_conn(*fake_status_codes) as fake_conn:
-            daemon.run_once()
+            daemon._process_device_in_child(self.dev_path, 'sda1')
         self.assertEqual(expected_success, daemon.stats.successes)
         expected_skipped = expected_total - expected_success
         self.assertEqual(expected_skipped, daemon.stats.skips)
@@ -1441,7 +1643,7 @@ class TestObjectUpdater(unittest.TestCase):
                          len(self._find_async_pending_files()))
         fake_status_codes = [200] * 3 * expected_total
         with mocked_http_conn(*fake_status_codes):
-            daemon.run_once()
+            daemon._process_device_in_child(self.dev_path, 'sda1')
         self.assertEqual(expected_total, daemon.stats.successes)
         self.assertEqual(0, daemon.stats.skips)
         self.assertEqual([], self._find_async_pending_files())
@@ -1502,7 +1704,7 @@ class TestObjectUpdater(unittest.TestCase):
         with mocked_http_conn(*fake_status_codes) as fake_conn, \
                 mock.patch('swift.obj.updater.RateLimitedIterator',
                            fake_rate_limited_iterator):
-            daemon.run_once()
+            daemon._process_device_in_child(self.dev_path, 'sda1')
         self.assertEqual(expected_success, daemon.stats.successes)
         expected_skipped = expected_total - expected_success
         self.assertEqual(expected_skipped, daemon.stats.skips)
@@ -1592,7 +1794,7 @@ class TestObjectUpdater(unittest.TestCase):
                                   fake_object_update), \
                 mock.patch('swift.obj.updater.RateLimitedIterator',
                            fake_rate_limited_iterator):
-            daemon.run_once()
+            daemon._process_device_in_child(self.dev_path, 'sda1')
         self.assertEqual(expected_success, daemon.stats.successes)
         expected_skipped = expected_total - expected_success
         self.assertEqual(expected_skipped, daemon.stats.skips)
@@ -1712,7 +1914,7 @@ class TestObjectUpdater(unittest.TestCase):
                 mock.patch('swift.obj.updater.RateLimitedIterator',
                            fake_rate_limited_iterator), \
                 mock.patch('swift.common.utils.eventlet.sleep') as mock_sleep:
-            daemon.run_once()
+            daemon._process_device_in_child(self.dev_path, 'sda1')
         self.assertEqual(expected_success, daemon.stats.successes)
         expected_skipped = expected_total - expected_success
         self.assertEqual(expected_skipped, daemon.stats.skips)
@@ -1840,7 +2042,7 @@ class TestObjectUpdater(unittest.TestCase):
                 mock.patch('swift.obj.updater.RateLimitedIterator',
                            fake_rate_limited_iterator), \
                 mock.patch('swift.common.utils.eventlet.sleep') as mock_sleep:
-            daemon.run_once()
+            daemon._process_device_in_child(self.dev_path, 'sda1')
         self.assertEqual(expected_success, daemon.stats.successes)
         expected_skipped = expected_total - expected_success
         self.assertEqual(expected_skipped, daemon.stats.skips)
