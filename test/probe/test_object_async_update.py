@@ -14,17 +14,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import uuid
+import shutil
+import random
+import time
+
+from datetime import datetime
 from io import BytesIO
 from unittest import main, SkipTest
 from uuid import uuid4
-import random
+
+from six.moves.configparser import ConfigParser
 
 from swiftclient import client
 from swiftclient.exceptions import ClientException
 
-from swift.common import direct_client
-from swift.common.manager import Manager
+from swift.common import direct_client, manager
+from swift.common.manager import Manager, Server
 from swift.common.swob import normalize_etag
+from swift.common.utils import readconf
 from test.probe.common import kill_nonprimary_server, \
     kill_server, ReplProbeTest, start_server, ECProbeTest
 
@@ -379,6 +388,131 @@ class TestObjectUpdaterStats(ReplProbeTest):
             recons.append(recon)
 
         self.assertEqual(4, len(recons))
+        found_counts = []
+        ac_set = set()
+        for recon in recons:
+            updater_stats = recon['object_updater_stats']
+
+            found_counts.append(
+                updater_stats['failures_account_container_count']
+            )
+
+            oldest_count = updater_stats[
+                'failures_oldest_timestamp_account_containers'
+            ]['oldest_count']
+            self.assertEqual(oldest_count, 5)
+
+            ts_ac_entries = updater_stats[
+                'failures_oldest_timestamp_account_containers'
+            ]['oldest_entries']
+            self.assertEqual(len(ts_ac_entries), oldest_count)
+
+            for entry in ts_ac_entries:
+                account = entry['account']
+                container = entry['container']
+                timestamp = entry['timestamp']
+                self.assertIsNotNone(timestamp)
+                ac_set.add((account, container))
+
+        for ac in ac_set:
+            self.assertIn(ac, set(ac_pairs))
+
+        for found_count in found_counts:
+            self.assertLessEqual(found_count, len(ac_pairs))
+
+
+class TestObjectUpdaterRunForever(ECProbeTest):
+
+    def setUp(self):
+        CONF_SECTION = 'object-updater'
+        super(TestObjectUpdaterRunForever, self).setUp()
+        self.int_client = self.make_internal_client()
+        self.container_servers = Manager(['container-server'])
+        self.object_updater = Manager(['object-updater'])
+        self.conf_dest = os.path.join(
+            '/tmp/',
+            datetime.now().strftime('swift-%Y-%m-%d_%H-%M-%S-%f')
+        )
+        os.mkdir(self.conf_dest)
+        object_server_dir = os.path.join(self.conf_dest, 'object-server')
+        os.mkdir(object_server_dir)
+        for conf_file in Server('object-updater').conf_files():
+            config = readconf(conf_file)
+            if CONF_SECTION not in config:
+                continue  # Ensure the object-updater is set up to run
+            config[CONF_SECTION].update({'interval': '1'})
+
+            parser = ConfigParser()
+            parser.add_section(CONF_SECTION)
+            for option, value in config[CONF_SECTION].items():
+                parser.set(CONF_SECTION, option, value)
+
+            file_name = os.path.basename(conf_file)
+            if file_name.endswith('.d'):
+                # Work around conf.d setups (like you might see with VSAIO)
+                file_name = file_name[:-2]
+            with open(os.path.join(object_server_dir, file_name), 'w') as fp:
+                parser.write(fp)
+
+        self.container_name = 'container-%s' % uuid.uuid4()
+        self.object_name = 'object-%s' % uuid.uuid4()
+
+    def tearDown(self):
+        shutil.rmtree(self.conf_dest)
+
+    def test_run_forever(self):
+        # Create some (acct, cont) pairs
+        num_accounts = 3
+        num_conts_per_a = 4
+        ac_pairs = []
+        for a in range(num_accounts):
+            acct = 'AUTH_user%03d' % a
+            self.int_client.create_account(acct)
+            for c in range(num_conts_per_a):
+                cont = 'cont%03d' % c
+                self.int_client.create_container(acct, cont)
+                ac_pairs.append((acct, cont))
+
+        # Shut down a couple container servers
+        for n in random.sample([1, 2, 3, 4], 2):
+            self.container_servers.stop(number=n)
+
+        # Create a bunch of objects
+        num_objs_per_ac = 5
+        for acct, cont in ac_pairs:
+            for o in range(num_objs_per_ac):
+                obj = 'obj%03d' % o
+                self.int_client.upload_object(BytesIO(b''), acct, cont, obj)
+
+        all_asyncs = self.gather_async_pendings()
+        # Between 1-2 asyncs per object
+        total_objs = num_objs_per_ac * len(ac_pairs)
+        self.assertGreater(len(all_asyncs), total_objs)
+        self.assertLess(len(all_asyncs), total_objs * 2)
+
+        # Run the updater and check stats
+        old_swift_dir = manager.SWIFT_DIR
+        manager.SWIFT_DIR = self.conf_dest
+        try:
+            self.object_updater.start()
+            updater_status = self.object_updater.status()
+            self.assertEqual(updater_status, 0,
+                             "Object updater failed to start")
+
+            # Wait for updates to process
+            time.sleep(20)
+        finally:
+            manager.SWIFT_DIR = old_swift_dir
+        recons = []
+        for onode in self.object_ring.devs:
+            recon = direct_client.direct_get_recon(onode, 'updater/object')
+            recons.append(recon)
+        self.assertEqual(8, len(recons))
+
+        # Stop the object updater
+        stop_status = self.object_updater.stop()
+        self.assertEqual(stop_status, 0, "Object updater failed to stop")
+
         found_counts = []
         ac_set = set()
         for recon in recons:

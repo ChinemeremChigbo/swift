@@ -35,7 +35,7 @@ from swift.common.utils import get_logger, renamer, write_pickle, \
     dump_recon_cache, config_true_value, RateLimitedIterator, split_path, \
     eventlet_monkey_patch, get_redirect_data, ContextPool, hash_path, \
     non_negative_float, config_positive_int_value, non_negative_int, \
-    EventletRateLimiter, node_to_string, parse_options
+    EventletRateLimiter, node_to_string, parse_options, load_recon_cache
 from swift.common.daemon import Daemon, run_daemon
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import split_policy_string, PolicyError
@@ -508,13 +508,14 @@ class ObjectUpdater(Daemon):
                          'completed: %(elapsed).02fs, %(stats)s'),
                         {'device': device, 'elapsed': elapsed,
                          'stats': self.stats})
+                    self.dump_device_recon(device, elapsed)
                     sys.exit()
             while pids:
                 pids.remove(os.wait()[0])
             elapsed = time.time() - self.begin
             self.logger.info('Object update sweep completed: %.02fs',
                              elapsed)
-            self.dump_recon(elapsed)
+            self.aggregate_and_dump_recon(elapsed)
             if elapsed < self.interval:
                 time.sleep(self.interval - elapsed)
 
@@ -541,31 +542,91 @@ class ObjectUpdater(Daemon):
             {'elapsed': elapsed, 'stats': self.stats})
         self.dump_recon(elapsed)
 
+    def _gather_recon_stats(self, elapsed=None):
+        """Gather stats common to both device and overall recon dumps."""
+        stats = {
+            'failures_oldest_timestamp':
+                self.oldest_async_pendings.get_oldest_timestamp(),
+            'failures_oldest_timestamp_age':
+                self.oldest_async_pendings.get_oldest_timestamp_age(),
+            'failures_account_container_count':
+                len(self.oldest_async_pendings.ac_to_timestamp),
+            'failures_oldest_timestamp_account_containers':
+                self.oldest_async_pendings.get_n_oldest_timestamp_acs(
+                    self.dump_count),
+            'tracker_memory_usage':
+                self.oldest_async_pendings.get_memory_usage(),
+        }
+        if elapsed is not None:
+            stats['elapsed'] = elapsed
+        return stats
+
     def dump_recon(self, elapsed):
         """Gathers stats and dumps recon cache."""
-        object_updater_stats = {
-            'failures_oldest_timestamp': (
-                self.oldest_async_pendings.get_oldest_timestamp()
-            ),
-            'failures_oldest_timestamp_age': (
-                self.oldest_async_pendings.get_oldest_timestamp_age()
-            ),
-            'failures_account_container_count': (
-                len(self.oldest_async_pendings.ac_to_timestamp)
-            ),
-            'failures_oldest_timestamp_account_containers': (
-                self.oldest_async_pendings.get_n_oldest_timestamp_acs(
-                    self.dump_count
-                )
-            ),
-            'tracker_memory_usage': (
-                self.oldest_async_pendings.get_memory_usage()
-            ),
-        }
+        object_updater_stats = self._gather_recon_stats()
         dump_recon_cache(
             {
                 'object_updater_sweep': elapsed,
                 'object_updater_stats': object_updater_stats,
+            },
+            self.rcache,
+            self.logger,
+        )
+
+    def dump_device_recon(self, device, elapsed):
+        """Dump recon stats for a single device."""
+        disk_recon_stats = self._gather_recon_stats(elapsed)
+        dump_recon_cache(
+            {'object_updater_per_device': {device: disk_recon_stats}},
+            self.rcache,
+            self.logger,
+        )
+
+    def aggregate_and_dump_recon(self, elapsed):
+        """
+        Aggregate recon stats across devices and dump the result to the recon
+        cache.
+        """
+        recon_cache = load_recon_cache(self.rcache)
+        device_stats = recon_cache.get('object_updater_per_device', {})
+
+        aggregated_oldest_entries = []
+
+        for stats in device_stats.values():
+            container_data = stats.get(
+                'failures_oldest_timestamp_account_containers', {})
+            aggregated_oldest_entries.extend(container_data.get(
+                'oldest_entries', []))
+
+        aggregated_oldest_entries = aggregated_oldest_entries[:self.dump_count]
+        aggregated_oldest_count = len(aggregated_oldest_entries)
+
+        aggregated_stats = {
+            'failures_account_container_count': sum(
+                stats.get('failures_account_container_count', 0)
+                for stats in device_stats.values()
+            ),
+            'tracker_memory_usage': sum(
+                stats.get('tracker_memory_usage', 0)
+                for stats in device_stats.values()
+            ),
+            'failures_oldest_timestamp': min(
+                (
+                    stats.get('failures_oldest_timestamp')
+                    for stats in device_stats.values()
+                    if stats.get('failures_oldest_timestamp') is not None
+                ),
+                default=None,
+            ),
+            'failures_oldest_timestamp_account_containers': {
+                'oldest_count': aggregated_oldest_count,
+                'oldest_entries': aggregated_oldest_entries,
+            },
+        }
+        dump_recon_cache(
+            {
+                'object_updater_sweep': elapsed,
+                'object_updater_stats': aggregated_stats,
             },
             self.rcache,
             self.logger,
