@@ -238,7 +238,7 @@ class Manager(object):
 
     """
 
-    def __init__(self, servers, run_dir=RUN_DIR):
+    def __init__(self, servers, run_dir=RUN_DIR, conf_dir=SWIFT_DIR):
         self.server_names = set()
         self._default_strict = True
         for server in servers:
@@ -257,7 +257,7 @@ class Manager(object):
         self.servers = set()
         for name in self.server_names:
             if verify_server(name):
-                self.servers.add(Server(name, run_dir))
+                self.servers.add(Server(name, run_dir, conf_dir))
 
     def __iter__(self):
         return iter(self.servers)
@@ -494,7 +494,7 @@ class Server(object):
     :param server: name of server
     """
 
-    def __init__(self, server, run_dir=RUN_DIR):
+    def __init__(self, server, run_dir=RUN_DIR, conf_dir=SWIFT_DIR):
         self.server = server.lower()
         if '.' in self.server:
             self.server, self.conf = self.server.rsplit('.', 1)
@@ -504,6 +504,7 @@ class Server(object):
         self.type = self.server.rsplit('-', 1)[0]
         self.procs = []
         self.run_dir = run_dir
+        self.conf_dir = conf_dir
 
     def __str__(self):
         return self.server
@@ -532,7 +533,7 @@ class Server(object):
 
         """
         return conf_file.replace(
-            os.path.normpath(SWIFT_DIR), self.run_dir, 1).replace(
+            os.path.normpath(self.conf_dir), self.run_dir, 1).replace(
                 '%s-server' % self.type, self.server, 1).replace(
                     '.conf', '.pid', 1)
 
@@ -546,20 +547,20 @@ class Server(object):
         """
         if self.server in STANDALONE_SERVERS:
             return pid_file.replace(
-                os.path.normpath(self.run_dir), SWIFT_DIR, 1).replace(
+                os.path.normpath(self.run_dir), self.conf_dir, 1).replace(
                     '.pid', '.conf', 1)
         else:
             return pid_file.replace(
-                os.path.normpath(self.run_dir), SWIFT_DIR, 1).replace(
+                os.path.normpath(self.run_dir), self.conf_dir, 1).replace(
                     self.server, '%s-server' % self.type, 1).replace(
                         '.pid', '.conf', 1)
 
     def _find_conf_files(self, server_search):
         if self.conf is not None:
-            return search_tree(SWIFT_DIR, server_search, self.conf + '.conf',
-                               dir_ext=self.conf + '.conf.d')
+            return search_tree(self.conf_dir, server_search, self.conf +
+                               '.conf', dir_ext=self.conf + '.conf.d')
         else:
-            return search_tree(SWIFT_DIR, server_search + '*', '.conf',
+            return search_tree(self.conf_dir, server_search + '*', '.conf',
                                dir_ext='.conf.d')
 
     def conf_files(self, **kwargs):

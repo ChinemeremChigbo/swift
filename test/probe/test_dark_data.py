@@ -26,7 +26,6 @@ from six.moves.configparser import ConfigParser
 
 from test.probe.brain import BrainSplitter
 from test.probe.common import ReplProbeTest
-from swift.common import manager
 from swift.common.storage_policy import get_policy_string
 from swift.common.manager import Manager, Server
 from swift.common.utils import readconf
@@ -140,12 +139,7 @@ class TestDarkDataDeletion(ReplProbeTest):
         self.assertLengthEqual(files['.data'], 3)
 
         # But that's OK, audit watchers to the rescue!
-        old_swift_dir = manager.SWIFT_DIR
-        manager.SWIFT_DIR = self.conf_dest
-        try:
-            Manager(['object-auditor']).once()
-        finally:
-            manager.SWIFT_DIR = old_swift_dir
+        Manager(['object-auditor'], conf_dir=self.conf_dest).once()
 
         # Verify that the policy was applied.
         self.check_on_disk_files(files['.data'])
