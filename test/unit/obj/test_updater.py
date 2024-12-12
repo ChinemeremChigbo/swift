@@ -716,9 +716,12 @@ class TestObjectUpdater(unittest.TestCase):
             'interval': '1',
             'concurrency': '1',
             'node_timeout': '15'}, logger=self.logger)
-        with mock.patch.object(ou, 'object_update',
-                               return_value=(False, 'node-id', None)):
-            ou.run_once()
+        ts = next(self.ts_iter)
+        now = float(next(self.ts_iter))
+        with mock.patch('swift.obj.updater.time.time', return_value=now):
+            with mock.patch.object(ou, 'object_update',
+                                   return_value=(False, 'node-id', None)):
+                ou.run_once()
         exp_recon_dump = {
             'object_updater_stats': {
                 'failures_account_container_count': 0,
@@ -729,10 +732,10 @@ class TestObjectUpdater(unittest.TestCase):
                 'failures_oldest_timestamp_age': None,
                 'tracker_memory_usage': mock.ANY},
             'object_updater_sweep': mock.ANY,
+            'object_updater_last': now,
         }
         assert_and_reset_recon_dump(exp_recon_dump)
 
-        ts = next(self.ts_iter)
         ohash = hash_path('a', 'c', 'o')
         odir = os.path.join(async_dir, ohash[-3:])
         mkdirs(odir)
@@ -744,7 +747,6 @@ class TestObjectUpdater(unittest.TestCase):
                              'X-Container-Timestamp':
                              normalize_timestamp(0)}},
                         async_pending)
-        now = float(next(self.ts_iter))
         with mock.patch('swift.obj.updater.time.time', return_value=now):
             with mock.patch.object(ou, 'object_update',
                                    return_value=(False, 'node-id', None)):
@@ -762,6 +764,7 @@ class TestObjectUpdater(unittest.TestCase):
                 'failures_oldest_timestamp_age': now - float(ts),
                 'tracker_memory_usage': mock.ANY},
             'object_updater_sweep': mock.ANY,
+            'object_updater_last': now,
         }
         assert_and_reset_recon_dump(exp_recon_dump)
 

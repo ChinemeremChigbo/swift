@@ -521,10 +521,11 @@ class ObjectUpdater(Daemon):
                     sys.exit()
             while pids:
                 pids.remove(os.wait()[0])
-            elapsed = time.time() - self.begin
+            now = time.time()
+            elapsed = now - self.begin
             self.logger.info('Object update sweep completed: %.02fs',
                              elapsed)
-            self.dump_recon(elapsed)
+            self.dump_recon(elapsed, now)
             if elapsed < self.interval:
                 time.sleep(self.interval - elapsed)
 
@@ -544,14 +545,15 @@ class ObjectUpdater(Daemon):
                 self.logger.warning('Skipping: %s', err)
                 continue
             self.object_sweep(dev_path)
-        elapsed = time.time() - self.begin
+        now = time.time()
+        elapsed = now - self.begin
         self.logger.info(
             ('Object update single-threaded sweep completed: '
              '%(elapsed).02fs, %(stats)s'),
             {'elapsed': elapsed, 'stats': self.stats})
-        self.dump_recon(elapsed)
+        self.dump_recon(elapsed, now)
 
-    def dump_recon(self, elapsed):
+    def dump_recon(self, elapsed, now):
         """Gathers stats and dumps recon cache."""
         object_updater_stats = {
             'failures_oldest_timestamp': (
@@ -576,6 +578,7 @@ class ObjectUpdater(Daemon):
             {
                 'object_updater_sweep': elapsed,
                 'object_updater_stats': object_updater_stats,
+                'object_updater_last': now
             },
             self.rcache,
             self.logger,

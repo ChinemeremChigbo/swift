@@ -406,6 +406,11 @@ class TestObjectUpdaterStats(ReplProbeTest):
                 self.assertIsInstance(timestamp, float)
                 ac_set.add((account, container))
 
+            object_updater_last = recon.get('object_updater_last')
+            self.assertIsNotNone(object_updater_last,
+                                 "object_updater_last is missing")
+            self.assertGreater(object_updater_last, 0,
+                               "Invalid object_updater_last time")
         for ac in ac_set:
             self.assertIn(ac, set(ac_pairs))
 
